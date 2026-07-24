@@ -284,6 +284,90 @@ fn new_from_utf8_simd_transcode() {
 }
 
 #[test]
+fn one_byte_string_paths_round_trip() {
+  // Locks the one-byte fast paths against silent corruption:
+  //  - SIMD ASCII detection in new_from_utf8 / onebyte_is_ascii, including the
+  //    32-byte early-reject head/tail split,
+  //  - fused Latin-1 -> UTF-8 transcode in to_rust_string_lossy, and
+  //  - to_rust_cow_lossy borrow + owned-overflow branches.
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let scope = pin!(v8::HandleScope::new(&mut isolate));
+  let mut scope = scope.init();
+  let context = v8::Context::new(&scope, Default::default());
+  let scope = &mut v8::ContextScope::new(&mut scope, context);
+
+  let mut cases: Vec<(std::string::String, std::string::String)> = Vec::new();
+
+  // One-byte (Latin-1) V8 strings at EXACT code-point counts straddling the
+  // 128 simdutf crossover and 4096 fuse threshold (strictly below / at / above),
+  // plus sizes under the 32-byte early-reject window. `"a"` -> pure ASCII;
+  // `"é"` -> every code point non-ASCII (1 one-byte unit, 2 UTF-8 bytes each).
+  for n in [
+    1usize, 2, 3, 31, 32, 33, 127, 128, 129, 500, 4095, 4096, 4097, 8000,
+  ] {
+    cases.push(("a".repeat(n), format!("ascii n={n}")));
+    cases.push(("é".repeat(n), format!("latin1 n={n}")));
+  }
+
+  // Head/tail split: ASCII for the first >=32 bytes, then a non-ASCII byte past
+  // the 32-byte early-reject window, so the simdutf `validate_ascii(&bytes[32..])`
+  // remainder scan (not the inline head check) is what must reject. A one-byte
+  // V8 string (all code points <= 0xFF). An off-by-one in the `bytes[head..]`
+  // offset would round-trip fine on the corpus above without these.
+  for k in [32usize, 33, 40, 200, 5000] {
+    cases.push(("a".repeat(k) + "é", format!("ascii_head{k}_then_latin1")));
+  }
+
+  // Two-byte V8 strings (BMP + supplementary) -> the TwoByte ValueView / wtf16
+  // paths, not the one-byte thresholds above.
+  for n in [1usize, 200, 5000] {
+    cases.push(("世界".repeat(n), format!("twobyte n={n}")));
+    cases.push(("🦕".repeat(n), format!("emoji n={n}")));
+  }
+
+  const N: usize = 1 << 16; // fits 2x the largest case above
+  let mut buf = [MaybeUninit::<u8>::uninit(); N];
+  for (s, label) in &cases {
+    let s = s.as_str();
+    // new(): V8 picks one-byte vs two-byte from content.
+    let local = v8::String::new(scope, s).unwrap();
+    assert_eq!(local.to_rust_string_lossy(scope), s, "string_lossy {label}");
+    assert_eq!(
+      &*local.to_rust_cow_lossy(scope, &mut buf),
+      s,
+      "cow_lossy {label}"
+    );
+    // new_from_utf8(): exercises onebyte_is_ascii / SIMD ASCII detection.
+    let from_utf8 =
+      v8::String::new_from_utf8(scope, s.as_bytes(), v8::NewStringType::Normal)
+        .unwrap();
+    assert_eq!(
+      from_utf8.to_rust_string_lossy(scope),
+      s,
+      "from_utf8 {label}"
+    );
+  }
+
+  // Cow owned-overflow: a buffer smaller than the input forces the owned
+  // branches instead of borrowing — `bytes.len() > N` (ASCII) and
+  // `utf8_len > N` -> `latin1_to_cow_str` owned. Both must still round-trip.
+  const SMALL_N: usize = 256;
+  let mut small = [MaybeUninit::<u8>::uninit(); SMALL_N];
+  for (s, label) in [
+    ("a".repeat(1000), "ascii owned"),
+    ("é".repeat(1000), "latin1 owned"),
+  ] {
+    let local = v8::String::new(scope, &s).unwrap();
+    assert_eq!(
+      &*local.to_rust_cow_lossy(scope, &mut small),
+      s.as_str(),
+      "cow_lossy {label}"
+    );
+  }
+}
+
+#[test]
 fn test_string() {
   let _setup_guard = setup::parallel_test();
   let isolate = &mut v8::Isolate::new(Default::default());
