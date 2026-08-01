@@ -18,6 +18,33 @@ use std::process::Command;
 use std::process::Stdio;
 use which::which;
 
+fn clang_resource_dir(clang_bin: &Path) -> Result<String, String> {
+  let output = Command::new(clang_bin)
+    .arg("-print-resource-dir")
+    .output()
+    .map_err(|error| {
+      format!("could not run {}: {error}", clang_bin.display())
+    })?;
+  if !output.status.success() {
+    return Err(format!(
+      "{} exited with {}",
+      clang_bin.display(),
+      output.status
+    ));
+  }
+  let resource_dir = String::from_utf8(output.stdout).map_err(|error| {
+    format!("{} returned non-UTF-8 output: {error}", clang_bin.display())
+  })?;
+  let resource_dir = resource_dir.trim();
+  if resource_dir.is_empty() {
+    return Err(format!(
+      "{} returned an empty resource directory",
+      clang_bin.display()
+    ));
+  }
+  Ok(resource_dir.to_string())
+}
+
 fn main() {
   println!("cargo:rerun-if-changed=.gn");
   println!("cargo:rerun-if-changed=BUILD.gn");
@@ -36,6 +63,7 @@ fn main() {
     "GN",
     "GN_ARGS",
     "HOST",
+    "LIBCLANG_PATH",
     "NINJA",
     "OUT_DIR",
     "RUSTY_V8_ARCHIVE",
@@ -141,12 +169,15 @@ fn acquire_lock() -> LockFile {
 }
 
 fn build_binding() {
-  // Bindgen needs Clang 19+ for V8's libc++ builtin type traits.
+  // Bindgen needs Clang 21.1+ for V8's libc++ builtin type traits.
   if env::var("LIBCLANG_PATH").is_err() {
-    eprintln!("Warning: LIBCLANG_PATH not set. Bindgen requires Clang 19+.");
-    eprintln!("Set LIBCLANG_PATH to your Clang 19 installation:");
-    eprintln!("  Linux:  export LIBCLANG_PATH=/usr/lib/llvm-19/lib");
+    eprintln!("Warning: LIBCLANG_PATH not set. Bindgen requires Clang 21.1+.");
+    eprintln!("Set LIBCLANG_PATH to your Clang 21 installation:");
+    eprintln!("  Linux:  export LIBCLANG_PATH=/usr/lib/llvm-21/lib");
     eprintln!("  macOS:  export LIBCLANG_PATH=$(brew --prefix llvm)/lib");
+    eprintln!(
+      "  Windows: set LIBCLANG_PATH to the directory containing libclang.dll"
+    );
   }
 
   let output = Command::new(python())
@@ -174,7 +205,8 @@ fn build_binding() {
     .copied()
     .collect();
 
-  // Use V8's custom libc++ headers (requires Clang 19+ libclang via LIBCLANG_PATH)
+  // Use V8's custom libc++ headers (requires Clang 21.1+ libclang via
+  // LIBCLANG_PATH)
   // IMPORTANT: libc++ headers must come before clang builtins
   let mut clang_args = vec![
     "-x".to_string(),
@@ -221,6 +253,29 @@ fn build_binding() {
       && let Ok(sysroot) = env::var("RUSTY_V8_MUSL_SYSROOT")
     {
       clang_args.push(format!("--sysroot={sysroot}"));
+    }
+  } else if target_os == "windows" {
+    // libclang otherwise discovers the runner's system Clang resource
+    // directory, which may not match the pinned Chromium libclang.
+    if let Ok(libclang_path) = env::var("LIBCLANG_PATH") {
+      let libclang_path = PathBuf::from(libclang_path);
+      if let Some(clang_dir) = libclang_path.parent() {
+        let clang_bin = clang_dir.join("bin/clang-cl.exe");
+        match clang_resource_dir(&clang_bin) {
+          Ok(resource_dir) => {
+            println!("clang_resource_dir (from LIBCLANG_PATH) {resource_dir}");
+            clang_args.push(format!("-resource-dir={resource_dir}"));
+          }
+          Err(error) => println!(
+            "cargo:warning=Skipping Clang resource directory override: {error}"
+          ),
+        }
+      } else {
+        println!(
+          "cargo:warning=Skipping Clang resource directory override: \
+           LIBCLANG_PATH has no parent directory"
+        );
+      }
     }
   } else if target_os == "ios" {
     // iOS: point bindgen at the iOS (device) or iOS-simulator SDK and set the
@@ -1089,6 +1144,31 @@ fn clang_download() -> PathBuf {
       .unwrap()
       .success()
   );
+
+  // Chromium ships libclang separately from the compiler on Windows. Use the
+  // matching pinned package for bindgen instead of whichever libclang happens
+  // to be installed on the host.
+  #[cfg(target_os = "windows")]
+  if env::var_os("LIBCLANG_PATH").is_none() {
+    assert!(
+      Command::new(python())
+        .arg("./tools/clang/scripts/update.py")
+        .arg("--output-dir")
+        .arg(&clang_base_path)
+        .arg("--package")
+        .arg("libclang")
+        .status()
+        .unwrap()
+        .success()
+    );
+    let libclang_path = clang_base_path.join("bin");
+    assert!(libclang_path.join("libclang.dll").exists());
+    println!("libclang_path (downloaded) {}", libclang_path.display());
+    unsafe {
+      env::set_var("LIBCLANG_PATH", libclang_path);
+    }
+  }
+
   assert!(clang_base_path.exists());
   clang_base_path
 }
@@ -1420,5 +1500,12 @@ edge [fontsize=10]
     assert!(files.contains("../../../example/src/input.txt"));
     assert!(files.contains("../../../example/src/count_bytes.py"));
     assert!(!files.contains("obj/hello/hello.o"));
+  }
+
+  #[test]
+  fn test_clang_resource_dir_missing_executable() {
+    let clang_bin = env::temp_dir()
+      .join(format!("rusty_v8_missing_clang_{}", std::process::id()));
+    assert!(clang_resource_dir(&clang_bin).is_err());
   }
 }

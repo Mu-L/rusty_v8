@@ -58,3 +58,7 @@
 [submodule "tools/win"]
 	path = tools/win
 	url = https://chromium.googlesource.com/chromium/src/tools/win
+	# Windows builds need DebugVisualizers from this checkout, but its standalone
+	# mirror can advertise commits before their objects are available. CI and the
+	# source-build instructions download the pinned archive instead.
+	update = none

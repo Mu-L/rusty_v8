@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -1482,11 +1483,11 @@ void v8__ObjectTemplate__SetNativeDataProperty(
 
 void v8__ObjectTemplate__SetNamedPropertyHandler(
     const v8::ObjectTemplate& self, v8::NamedPropertyGetterCallback getter,
-    v8::NamedPropertySetterCallback setter,
+    v8::NamedPropertySetterCallbackV2 setter,
     v8::NamedPropertyQueryCallback query,
     v8::NamedPropertyDeleterCallback deleter,
     v8::NamedPropertyEnumeratorCallback enumerator,
-    v8::NamedPropertyDefinerCallback definer,
+    v8::NamedPropertyDefinerCallbackV2 definer,
     v8::NamedPropertyDescriptorCallback descriptor,
     const v8::Value* data_or_null, v8::PropertyHandlerFlags flags) {
   ptr_to_local(&self)->SetHandler(v8::NamedPropertyHandlerConfiguration(
@@ -1496,11 +1497,11 @@ void v8__ObjectTemplate__SetNamedPropertyHandler(
 
 void v8__ObjectTemplate__SetIndexedPropertyHandler(
     const v8::ObjectTemplate& self, v8::IndexedPropertyGetterCallbackV2 getter,
-    v8::IndexedPropertySetterCallbackV2 setter,
+    v8::IndexedPropertySetterCallback setter,
     v8::IndexedPropertyQueryCallbackV2 query,
     v8::IndexedPropertyDeleterCallbackV2 deleter,
     v8::IndexedPropertyEnumeratorCallback enumerator,
-    v8::IndexedPropertyDefinerCallbackV2 definer,
+    v8::IndexedPropertyDefinerCallback definer,
     v8::IndexedPropertyDescriptorCallbackV2 descriptor,
     const v8::Value* data_or_null, v8::PropertyHandlerFlags flags) {
   ptr_to_local(&self)->SetHandler(v8::IndexedPropertyHandlerConfiguration(
@@ -2246,13 +2247,39 @@ const v8::Value* v8__Context__GetContinuationPreservedEmbedderData(
   return local_to_ptr(value);
 }
 
-v8::MicrotaskQueue* v8__MicrotaskQueue__New(v8::Isolate* isolate,
-                                            v8::MicrotasksPolicy policy) {
-  return v8::MicrotaskQueue::New(isolate, policy).release();
+class RustyMicrotaskQueueHandle {
+ public:
+  RustyMicrotaskQueueHandle(v8::Isolate* isolate, v8::MicrotasksPolicy policy)
+      : queue_(v8::MicrotaskQueue::New(isolate, policy)) {}
+
+  v8::MicrotaskQueue* Get() const {
+#ifdef V8_CPPGC_MICROTASK_QUEUE
+    return queue_.Get();
+#else
+    return queue_.get();
+#endif
+  }
+
+ private:
+#ifdef V8_CPPGC_MICROTASK_QUEUE
+  cppgc::Persistent<v8::MicrotaskQueue> queue_;
+#else
+  std::unique_ptr<v8::MicrotaskQueue> queue_;
+#endif
+};
+
+RustyMicrotaskQueueHandle* v8__MicrotaskQueueHandle__New(
+    v8::Isolate* isolate, v8::MicrotasksPolicy policy) {
+  return new RustyMicrotaskQueueHandle(isolate, policy);
 }
 
-void v8__MicrotaskQueue__DESTRUCT(v8::MicrotaskQueue* self) {
-  self->~MicrotaskQueue();
+void v8__MicrotaskQueueHandle__DELETE(RustyMicrotaskQueueHandle* self) {
+  delete self;
+}
+
+v8::MicrotaskQueue* v8__MicrotaskQueueHandle__Get(
+    const RustyMicrotaskQueueHandle* self) {
+  return self->Get();
 }
 
 void v8__MicrotaskQueue__PerformCheckpoint(v8::Isolate* isolate,
@@ -4278,8 +4305,8 @@ void v8__CompiledWasmModule__DELETE(v8::CompiledWasmModule* self) {
 extern "C" {
 
 size_t icu_get_default_locale(char* output, size_t output_len) {
-  const icu_77::Locale& default_locale = icu::Locale::getDefault();
-  icu_77::CheckedArrayByteSink sink(output, static_cast<uint32_t>(output_len));
+  const icu::Locale& default_locale = icu::Locale::getDefault();
+  icu::CheckedArrayByteSink sink(output, static_cast<uint32_t>(output_len));
   UErrorCode status = U_ZERO_ERROR;
   default_locale.toLanguageTag(sink, status);
   assert(status == U_ZERO_ERROR);

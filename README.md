@@ -1,6 +1,6 @@
 # Rusty V8 Binding
 
-V8 Version: 15.0.245.2
+V8 Version: 15.2.124.1
 
 [![ci](https://github.com/denoland/rusty_v8/workflows/ci/badge.svg?branch=main)](https://github.com/denoland/rusty_v8/actions)
 [![crates](https://img.shields.io/crates/v/v8.svg)](https://crates.io/crates/v8)
@@ -120,15 +120,25 @@ For linux builds: glib-2.0 development files need to be installed such that
 pkg-config can find them. On Ubuntu, run `sudo apt install libglib2.0-dev` to
 install them.
 
-Additionally, building from source requires libclang 19+ for bindgen:
+Additionally, building from source requires libclang 21.1+ for bindgen:
 
 ```bash
-sudo apt install libclang-19-dev
-export LIBCLANG_PATH=/usr/lib/llvm-19/lib
+sudo apt install libclang-21-dev
+export LIBCLANG_PATH=/usr/lib/llvm-21/lib
 ```
 
 For Windows builds: the 64-bit toolchain needs to be used. 32-bit targets are
-not supported.
+not supported. The default source build downloads Chromium's pinned libclang
+automatically. If `$CLANG_BASE_PATH` is set to a custom LLVM installation,
+`$LIBCLANG_PATH` must point to the directory containing `libclang.dll`.
+The `tools/win` submodule is skipped because its standalone mirror is
+unreliable, so source builds must populate its pinned debugger visualizers:
+
+```bash
+mkdir -p tools/win
+curl -fL https://chromium.googlesource.com/chromium/src/tools/win/+archive/faefd1b6fa9eeb033ad6fe60368ccb9bf908cbd0.tar.gz |
+  tar -xz -C tools/win
+```
 
 For Mac builds: You'll need Xcode and Xcode CLT installed. Recent macOS versions
 will also require you to pass PYTHON=python3 because macOS no longer ships with
