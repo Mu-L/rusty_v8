@@ -143,17 +143,17 @@ fn global_handles() {
   {
     v8::scope!(let scope, isolate);
 
-    assert_eq!(g1.open(scope).to_rust_string_lossy(scope), "bla");
-    assert_eq!(g2.as_ref().unwrap().open(scope).value(), 123);
-    assert_eq!(g3.open(scope).value(), 123);
-    assert_eq!(g4.open(scope).value(), 123);
+    assert_eq!(unsafe { g1.open(scope) }.to_rust_string_lossy(scope), "bla");
+    assert_eq!(unsafe { g2.as_ref().unwrap().open(scope) }.value(), 123);
+    assert_eq!(unsafe { g3.open(scope) }.value(), 123);
+    assert_eq!(unsafe { g4.open(scope) }.value(), 123);
     {
-      let num = g5.as_ref().unwrap().open(scope);
+      let num = unsafe { g5.as_ref().unwrap().open(scope) };
       assert_eq!(num.value(), 100);
     }
     g5.take();
     assert!(g6 == g1);
-    assert_eq!(g6.open(scope).to_rust_string_lossy(scope), "bla");
+    assert_eq!(unsafe { g6.open(scope) }.to_rust_string_lossy(scope), "bla");
   }
   {
     let g1_ptr = g1.clone().into_raw();
@@ -208,11 +208,23 @@ fn local_handle_deref() {
   let key = v8::String::new(scope, "key").unwrap();
   let obj: v8::Local<v8::Object> = v8::Object::new(scope);
   obj.get(scope, key.into());
-  {
-    use v8::Handle;
-    obj.get(scope, key.into());
-    obj.open(scope).get(scope, key.into());
+}
+
+#[test]
+fn v8_string_is_not_sync() {
+  trait AmbiguousIfImpl<A> {
+    fn some_item() {}
   }
+
+  impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+
+  #[allow(dead_code)]
+  struct Invalid;
+  impl<T: ?Sized + Sync> AmbiguousIfImpl<Invalid> for T {}
+
+  // If `v8::String` implements `Sync`, both impls above apply and this becomes
+  // ambiguous. `v8::String: !Sync` also means `&v8::String: !Send`.
+  let _ = <v8::String as AmbiguousIfImpl<_>>::some_item;
 }
 
 #[test]
@@ -5661,7 +5673,9 @@ fn get_hash() {
     }
     let map =
       once((v8::Global::new(scope, pri1), i)).collect::<HashMap<_, _>>();
-    assert_eq!(map[&*pri2], i);
+    // Looked up by an equal `Global`: `Global<T>` no longer borrows as
+    // `&T`, so the key type is the only way in.
+    assert_eq!(map[&v8::Global::new(scope, pri2)], i);
   }
 
   assert_eq!(name_count, 3);
@@ -5704,7 +5718,7 @@ fn get_hash() {
       }
       let map =
         once((v8::Global::new(scope, obj), i)).collect::<HashMap<_, _>>();
-      assert_eq!(map[&*obj], i);
+      assert_eq!(map[&v8::Global::new(scope, obj)], i);
     }
 
     assert!(collision_count <= 2);
@@ -11765,7 +11779,7 @@ fn context_embedder_data() {
   {
     v8::scope!(let scope, isolate);
 
-    let context = global_context.open(scope);
+    let context = unsafe { global_context.open(scope) };
     let actual0 =
       context.get_aligned_pointer_from_embedder_data(0) as *mut &str;
     let actual0 = unsafe { *actual0 };
@@ -14831,7 +14845,7 @@ fn shared_isolate_global_clone_without_locker_is_rejected() {
 }
 
 #[test]
-fn shared_isolate_global_borrow_is_rejected() {
+fn shared_isolate_global_open_under_lock() {
   let _setup_guard = setup::parallel_test();
   let shared = unsafe {
     v8::Isolate::new(Default::default())
@@ -14846,51 +14860,11 @@ fn shared_isolate_global_borrow_is_rejected() {
     v8::Global::new(&scope, local)
   };
 
-  let borrow_err =
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-      let _: &v8::String = std::borrow::Borrow::borrow(&global);
-    }))
-    .unwrap_err();
-  let borrow_msg = borrow_err
-    .downcast_ref::<String>()
-    .map(|s| s.as_str())
-    .or_else(|| borrow_err.downcast_ref::<&str>().copied())
-    .unwrap();
-  assert!(borrow_msg.contains("create a Local"));
-}
-
-#[test]
-fn shared_isolate_global_open_is_rejected() {
-  let _setup_guard = setup::parallel_test();
-  let shared = unsafe {
-    v8::Isolate::new(Default::default())
-      .try_into_shared()
-      .unwrap()
-  };
-  let global = {
-    let mut locker = shared.lock();
-    let scope = pin!(v8::HandleScope::new(&mut *locker));
-    let scope = scope.init();
-    let local = v8::String::new(&scope, "locked").unwrap();
-    v8::Global::new(&scope, local)
-  };
   let mut locker = shared.lock();
-  let open_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    let _ = global.open(&mut locker);
-  }))
-  .unwrap_err();
-  let open_msg = open_err
-    .downcast_ref::<String>()
-    .map(|s| s.as_str())
-    .or_else(|| open_err.downcast_ref::<&str>().copied())
-    .unwrap();
-  assert!(open_msg.contains("create a Local"));
-
-  // The lock-bound Local path remains available.
+  let value = unsafe { global.open(&mut locker) };
   let scope = pin!(v8::HandleScope::new(&mut *locker));
   let scope = scope.init();
-  let local = v8::Local::new(&scope, &global);
-  assert_eq!(local.to_rust_string_lossy(&scope), "locked");
+  assert_eq!(value.to_rust_string_lossy(&scope), "locked");
 }
 
 #[test]
@@ -15481,6 +15455,285 @@ fn shared_isolate_terminate_from_thread_safe_handle() {
   let handle = shared.thread_safe_handle();
   assert!(handle.terminate_execution());
   t.join().unwrap();
+}
+#[test]
+fn global_send_across_threads() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let (g1, g2) = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let s1 = v8::String::new(&scope, "one").unwrap();
+    let s2 = v8::String::new(&scope, "two").unwrap();
+    (v8::Global::new(&scope, s1), v8::Global::new(&scope, s2))
+  };
+  // Ship both Globals to another thread; drop one there (deferred until
+  // isolate teardown since that thread can't touch the isolate), and
+  // send the other back.
+  let g2 = std::thread::spawn(move || {
+    drop(g1);
+    g2
+  })
+  .join()
+  .unwrap();
+  // The returned Global is still usable on the isolate's home thread.
+  {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let local = v8::Local::new(&scope, g2);
+    assert_eq!(local.to_rust_string_lossy(&scope), "two");
+  }
+}
+
+#[test]
+fn shared_isolate_global_send() {
+  let _setup_guard = setup::parallel_test();
+  let shared = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+  let global = {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    let s = v8::String::new(&scope, "hello").unwrap();
+    v8::Global::new(&scope, s)
+  };
+  // Send the Global to another thread and use it under that thread's
+  // lock: dereference, clone, and drop it there.
+  let s = shared.clone();
+  std::thread::spawn(move || {
+    let mut locker = s.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    let global_ = global.clone();
+    let local = v8::Local::new(&scope, global);
+    assert_eq!(local.to_rust_string_lossy(&scope), "hello");
+    drop(global_);
+  })
+  .join()
+  .unwrap();
+}
+
+#[test]
+fn global_clone_off_thread_panics() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let global = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let s = v8::String::new(&scope, "nope").unwrap();
+    v8::Global::new(&scope, s)
+  };
+  let err = std::thread::spawn(move || {
+    let _ = global.clone();
+  })
+  .join()
+  .unwrap_err();
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(msg.contains("requires being on its isolate's thread"));
+}
+
+#[test]
+fn global_eq_off_thread_panics() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let (g1, g2) = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let s = v8::String::new(&scope, "same").unwrap();
+    (v8::Global::new(&scope, s), v8::Global::new(&scope, s))
+  };
+  let err = std::thread::spawn(move || {
+    let _ = g1 == g2;
+  })
+  .join()
+  .unwrap_err();
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(msg.contains("requires being on its isolate's thread"));
+}
+
+#[test]
+fn globals_from_different_isolates_compare_false_off_thread() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate_a = v8::Isolate::new(Default::default());
+  let global_a = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate_a));
+    let scope = scope.init();
+    let value = v8::String::new(&scope, "a").unwrap();
+    v8::Global::new(&scope, value)
+  };
+
+  // Host identity can reject this comparison without touching either V8
+  // object, even though A is not accessible on B's home thread.
+  let equal = std::thread::spawn(move || {
+    let mut isolate_b = v8::Isolate::new(Default::default());
+    let global_b = {
+      let scope = pin!(v8::HandleScope::new(&mut isolate_b));
+      let scope = scope.init();
+      let value = v8::String::new(&scope, "a").unwrap();
+      v8::Global::new(&scope, value)
+    };
+    global_a == global_b
+  })
+  .join()
+  .unwrap();
+  assert!(!equal);
+}
+
+#[test]
+fn global_hash_after_isolate_disposal_has_stable_panic() {
+  let _setup_guard = setup::parallel_test();
+  let global = {
+    let mut isolate = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let value = v8::String::new(&scope, "hash").unwrap();
+    v8::Global::new(&scope, value)
+  };
+
+  let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut hasher = DefaultHasher::new();
+    global.hash(&mut hasher);
+  }))
+  .unwrap_err();
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert_eq!(
+    msg,
+    "can't hash Global after its host Isolate has been disposed"
+  );
+}
+
+#[test]
+fn global_off_thread_drop_is_drained_on_home_thread() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let (global, weak) = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let obj = v8::Object::new(scope);
+    (v8::Global::new(scope, obj), v8::Weak::new(scope, obj))
+  };
+  // Drop the only strong handle on another thread: the cell is queued,
+  // not released, so the object must survive a GC.
+  std::thread::spawn(move || drop(global)).join().unwrap();
+  isolate.low_memory_notification();
+  assert!(!weak.is_empty());
+  // Any Global created on the home thread is a drain checkpoint; after
+  // it the queued cell is released and the object is collectable.
+  {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let s = v8::String::new(&scope, "checkpoint").unwrap();
+    let _g = v8::Global::new(&scope, s);
+  }
+  isolate.low_memory_notification();
+  assert!(weak.is_empty());
+}
+
+#[test]
+fn global_drop_from_cold_tls_destructor() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let global = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let scope = scope.init();
+    let value = v8::String::new(&scope, "tls").unwrap();
+    v8::Global::new(&scope, value)
+  };
+
+  std::thread::spawn(move || {
+    thread_local! {
+      static TLS_GLOBAL: RefCell<Option<v8::Global<v8::String>>> =
+        const { RefCell::new(None) };
+    }
+    // Do not otherwise touch rusty_v8 on this thread. The first request for
+    // its thread ID therefore happens while TLS_GLOBAL is being destroyed.
+    TLS_GLOBAL.with(|slot| *slot.borrow_mut() = Some(global));
+  })
+  .join()
+  .unwrap();
+}
+
+#[test]
+fn global_clone_inside_unlock_window_panics() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker = shared.lock();
+  let global = {
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    let s = v8::String::new(&scope, "nope").unwrap();
+    v8::Global::new(&scope, s)
+  };
+  // Inside the window this thread no longer holds the lock, so
+  // `thread_holds_lock` must say so — a stale "yes" would let this clone
+  // touch handle storage while another thread owns the isolate.
+  let err = locker.unlock(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _ = global.clone();
+    }))
+    .unwrap_err()
+  });
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(msg.contains("requires holding its Locker"));
+  // And the shadow is restored, so cloning works again under the lock.
+  let _clone = global.clone();
+  drop(locker);
+}
+
+#[test]
+fn local_eq_global_off_thread_panics() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate_a = v8::Isolate::new(Default::default());
+  let global_a = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate_a));
+    let scope = scope.init();
+    let s = v8::String::new(&scope, "a").unwrap();
+    v8::Global::new(&scope, s)
+  };
+  // Reversed operands. The `Local`-left `PartialEq` reaches the Global
+  // through `Handle::assert_safe_to_access`, which has to apply the same
+  // gate the `Global`-left impl does — otherwise this dereferences a
+  // Global belonging to isolate A, off A's thread, from isolate B.
+  let err = std::thread::spawn(move || {
+    let mut isolate_b = v8::Isolate::new(Default::default());
+    let scope = pin!(v8::HandleScope::new(&mut isolate_b));
+    let scope = scope.init();
+    let local_b = v8::String::new(&scope, "a").unwrap();
+    let _ = local_b == global_a;
+  })
+  .join()
+  .unwrap_err();
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(msg.contains("requires being on its isolate's thread"));
 }
 fn callable_object_callback(
   _: &mut v8::PinScope,

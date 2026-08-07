@@ -25,6 +25,22 @@ unsafe extern "C" {
   fn v8__Isolate__TryGetCurrent() -> *mut RealIsolate;
 }
 
+/// Whether the current thread holds the `v8::Locker` for `isolate`.
+///
+/// This asks V8 rather than shadowing the lock state in a thread-local.
+/// A shadow would be a little cheaper on the `Global` clone/drop/eq/hash
+/// path, but it has to stay correct in two places it is hard to
+/// guarantee: it must be updated across [`Locker::unlock`] windows, and
+/// any thread-local holding it is destructible, so a `Locker` or shared
+/// `Global` living in a thread-local that was initialized *earlier* would
+/// touch it from its destructor after it had already been torn down —
+/// `LocalKey::with` panics there, and a panic in a TLS destructor aborts.
+/// A false positive here would let `Global::drop` reset a cell without
+/// the lock, so correctness wins over the FFI call.
+pub(crate) fn thread_holds_lock(isolate: *mut RealIsolate) -> bool {
+  unsafe { v8__Locker__IsLocked(isolate) }
+}
+
 /// Raw storage for a `v8::Locker`. Its size is checked by a static_assert
 /// in binding.cc. It is not address-sensitive (it holds two flags and an
 /// isolate pointer), but it lives in a `Box` anyway so its address stays
@@ -49,11 +65,14 @@ pub(crate) struct RawUnlocker([usize; 1]);
 ///   isolate with live weaks or pending finalizers is rejected by conversion.
 /// - Snapshot-creator isolates and isolates with a cppgc heap attached
 ///   are rejected by conversion.
-/// - Opening or borrowing a [`crate::Global`] is unsupported; convert it to a
-///   [`crate::Local`] under a handle scope. Other access, such as cloning,
-///   hashing, or comparing, requires holding the lock on the current thread.
+/// - Opening a [`crate::Global`] into a plain reference is unsafe, and that
+///   reference must remain on the current thread and not outlive the lock.
+///   Prefer converting it to a [`crate::Local`] under a handle scope. Other
+///   access, such as cloning, hashing, or comparing, also requires holding the
+///   lock on the current thread.
 ///
-/// [`crate::Global`]s may be dropped on any thread at any time: if the
+/// [`crate::Global`]s are `Send` and may be dropped on any thread at any time:
+/// if the
 /// dropping thread holds the lock its V8 cell is reset immediately. Otherwise
 /// the reset is deferred until the next lock acquisition, [`Locker::unlock`],
 /// [`Locker`] drop, or isolate teardown. Until then it remains a GC root and
@@ -69,6 +88,22 @@ pub(crate) struct RawUnlocker([usize; 1]);
 ///
 /// Use [`Locker::unlock`] to release the lock around such work so other
 /// threads can make progress in the meantime.
+///
+/// # Cost
+///
+/// [`SharedIsolate::lock`] is not uniformly cheap: its cost scales with how
+/// often the *entering thread changes*. V8's `ThreadManager` archives an
+/// isolate's per-thread state when a different thread takes the lock and
+/// restores it on the way back in, so a sequence of locks from one thread is
+/// far cheaper than the same sequence alternating between two.
+///
+/// This matters for work-stealing executors, which are free to run each of
+/// an isolate's turns on a different worker and so maximise the migration.
+/// A measured case: an embedder serving a trivial request per lock lost
+/// about 9% of its throughput moving from one worker thread to twelve, with
+/// the *same* number of locks in both — the loss was migration alone. If an
+/// embedder can keep consecutive locks of one isolate on one thread, or run
+/// fewer workers, it is worth doing.
 #[derive(Debug)]
 pub struct SharedIsolate {
   inner: Arc<SharedIsolateInner>,
@@ -177,7 +212,7 @@ impl<'s> Locker<'s> {
     let ptr = shared.as_real_ptr();
     unsafe {
       assert!(
-        !v8__Locker__IsLocked(ptr),
+        !thread_holds_lock(ptr),
         "attempted to lock an isolate that is already locked by this thread"
       );
       assert!(
@@ -197,7 +232,7 @@ impl<'s> Locker<'s> {
       locker
         .global_liveness()
         .as_ref()
-        .drain_deferred_global_resets();
+        .maybe_drain_deferred_global_resets();
       locker
     }
   }
@@ -238,7 +273,7 @@ impl<'s> Locker<'s> {
       self
         .global_liveness()
         .as_ref()
-        .drain_deferred_global_resets();
+        .maybe_drain_deferred_global_resets();
     }
     unsafe { v8__Isolate__Exit(ptr) };
     let mut raw = Box::new(RawUnlocker([0; 1]));
@@ -279,7 +314,7 @@ impl Drop for RelockGuard {
       Isolate::from_non_null(self.cxx_isolate)
         .global_liveness()
         .as_ref()
-        .drain_deferred_global_resets();
+        .maybe_drain_deferred_global_resets();
     }
   }
 }
@@ -293,7 +328,7 @@ impl Drop for Locker<'_> {
       self
         .global_liveness()
         .as_ref()
-        .drain_deferred_global_resets();
+        .maybe_drain_deferred_global_resets();
       assert!(
         std::ptr::eq(self.cxx_isolate.as_ptr(), v8__Isolate__TryGetCurrent()),
         "Locker dropped while its isolate was not the entered one; lockers \

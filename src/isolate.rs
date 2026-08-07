@@ -71,6 +71,7 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
 
 /// Policy for running microtasks:
 ///   - explicit: microtasks are invoked with the
@@ -1057,8 +1058,12 @@ impl Isolate {
     // (ANNEX_SLOT is only cleared by code further down this teardown
     // path).
     unsafe {
-      // Null the `IsolateHandle` so handles outliving the isolate see a
-      // disposed state.
+      // Release Globals dropped by threads that could not touch the
+      // isolate, then null the `IsolateHandle` so handles outliving the
+      // isolate see a disposed state.
+      (*annex_ptr)
+        .global_liveness()
+        .close_deferred_global_resets();
       (*annex_ptr).global_liveness().dispose();
       (*annex_ptr).isolate_handle.dispose();
     }
@@ -2164,13 +2169,56 @@ impl DeferredGlobalReset {
   }
 }
 
+// Zero is reserved for a thread whose ID has not been requested yet. IDs are
+// never reused; abort before wrapping rather than risk confusing two threads.
+static NEXT_THREAD_ID: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+  // Const-initialized and destructor-free, so this remains readable while
+  // other TLS values are being destroyed. `Global::clone`/`drop` hit this on
+  // every call.
+  static CURRENT_THREAD_ID: std::cell::Cell<usize> =
+    const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn current_thread_id() -> usize {
+  CURRENT_THREAD_ID.with(|current| {
+    let id = current.get();
+    if id != 0 {
+      return id;
+    }
+
+    // This cold path deliberately avoids `std::thread::current()`: it may run
+    // from another TLS destructor, where panicking would abort the process.
+    // A relaxed global counter is sufficient because IDs are only compared.
+    let id = NEXT_THREAD_ID
+      .fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |next| next.checked_add(1),
+      )
+      .unwrap_or_else(|_| std::process::abort());
+    current.set(id);
+    id
+  })
+}
+
 pub(crate) struct IsolateLiveness {
   isolate: AtomicPtr<RealIsolate>,
+  /// The thread the isolate was created on. Meaningful only while the
+  /// isolate is not shared: a non-shared isolate never leaves it.
+  home_thread: usize,
   shared: std::sync::atomic::AtomicBool,
-  /// V8 cells whose Rust `Global` owners were dropped without holding the
-  /// isolate's `v8::Locker`. Drained on the next lock boundary; `None` after
-  /// teardown has done its final drain. Only used when `shared` is set.
+  /// V8 cells whose Rust `Global` owners were dropped by threads that could
+  /// not touch the isolate. Drained at the next checkpoint: lock and unlock
+  /// boundaries for shared isolates, and `Global` creation or home-thread
+  /// `Global` drops for all isolates. `None` after teardown's final drain.
   deferred_global_resets: Mutex<Option<Vec<DeferredGlobalReset>>>,
+  /// Length hint for `deferred_global_resets`, so drain checkpoints are a
+  /// relaxed load in the common (empty) case instead of a mutex
+  /// acquisition. Updated under the mutex.
+  deferred_len: std::sync::atomic::AtomicUsize,
 }
 
 impl IsolateLiveness {
@@ -2178,8 +2226,10 @@ impl IsolateLiveness {
   fn new(isolate: &Isolate) -> Self {
     Self {
       isolate: AtomicPtr::new(isolate.as_real_ptr()),
+      home_thread: current_thread_id(),
       shared: std::sync::atomic::AtomicBool::new(false),
       deferred_global_resets: Mutex::new(Some(Vec::new())),
+      deferred_len: std::sync::atomic::AtomicUsize::new(0),
     }
   }
 
@@ -2196,6 +2246,10 @@ impl IsolateLiveness {
   }
 
   pub(crate) fn mark_shared(&self) {
+    assert!(
+      self.on_home_thread(),
+      "an isolate must be converted to SharedIsolate on its home thread"
+    );
     // Release/Acquire so a thread that observes `shared == false` (and
     // takes the immediate-reset path in `Global::drop`) cannot do so
     // after the isolate has started migrating between threads.
@@ -2209,34 +2263,68 @@ impl IsolateLiveness {
     self.shared.load(std::sync::atomic::Ordering::Acquire)
   }
 
-  /// Validate access to a shared isolate while synchronizing with teardown.
-  ///
-  /// The queue mutex keeps the isolate pointer valid through `IsLocked`. If the
-  /// current thread does hold the V8 lock, that lock in turn prevents teardown
-  /// after the mutex is released and for the duration of the caller's access.
-  pub(crate) fn assert_locked_for_shared_access(&self) {
+  /// The one gate for touching a `Global`'s V8 cell. Covers both cases:
+  /// a shared isolate needs its `Locker` held here, a non-shared one
+  /// needs the home thread. It has to be checked for non-shared isolates
+  /// too — `Global` is `Send`, so a plain `OwnedIsolate` can stay on
+  /// thread A while one of its `Global`s is used on thread B, racing A's
+  /// GC.
+  pub(crate) fn assert_access_allowed(&self) {
     if !self.is_shared() {
+      // A non-shared OwnedIsolate cannot leave its home thread through safe
+      // Rust. Being on that thread therefore also excludes racing teardown,
+      // so the hot path needs no mutex.
+      assert!(
+        !self.get_isolate_ptr().is_null(),
+        "attempt to access Handle hosted by disposed Isolate"
+      );
+      assert!(
+        self.on_home_thread(),
+        "accessing a Global requires being on its isolate's thread"
+      );
       return;
     }
+
+    // Sample liveness while holding the reset queue: teardown closes the
+    // queue under this mutex before disposing. If this thread holds the V8
+    // lock, that lock prevents teardown after the mutex is released and for
+    // the duration of the caller's access.
     let q = self.deferred_global_resets.lock().unwrap();
-    let isolate = self.get_isolate_ptr();
-    let isolate_is_live = q.is_some() && !isolate.is_null();
-    let is_locked = isolate_is_live
-      && unsafe { crate::locker::v8__Locker__IsLocked(isolate) };
+    let isolate_is_live = q.is_some() && !self.get_isolate_ptr().is_null();
+    let allowed = isolate_is_live && self.on_isolate_thread();
     drop(q);
     assert!(
       isolate_is_live,
       "attempt to access Handle hosted by disposed Isolate"
     );
     assert!(
-      is_locked,
-      "accessing a Global belonging to a shared isolate requires holding its \
-       Locker on the current thread"
+      allowed,
+      "accessing a Global belonging to a shared isolate requires holding \
+       its Locker on the current thread"
     );
   }
 
-  /// Release a `Global`'s cell now if the current thread holds the
-  /// isolate's lock; otherwise queue it for the next lock acquisition.
+  /// True when the current thread may touch the isolate's handle
+  /// storage: it holds the isolate's `v8::Locker` (shared), or it is the
+  /// isolate's home thread (non-shared).
+  #[inline(always)]
+  pub(crate) fn on_home_thread(&self) -> bool {
+    current_thread_id() == self.home_thread
+  }
+
+  pub(crate) fn on_isolate_thread(&self) -> bool {
+    if self.is_shared() {
+      let isolate = self.get_isolate_ptr();
+      // A disposed isolate cannot be locked by anyone.
+      !isolate.is_null() && crate::locker::thread_holds_lock(isolate)
+    } else {
+      self.on_home_thread()
+    }
+  }
+
+  /// Release a `Global`'s cell now if the current thread may touch the
+  /// isolate; otherwise queue it for the next lock acquisition (shared)
+  /// or isolate teardown (non-shared).
   ///
   /// While the queue is `Some`, teardown has not started: its final drain
   /// closes the queue under this mutex before the isolate is disposed, so
@@ -2246,22 +2334,37 @@ impl IsolateLiveness {
   pub(crate) fn reset_or_defer_global(&self, data: NonNull<Data>) {
     let mut q = self.deferred_global_resets.lock().unwrap();
     let Some(v) = q.as_mut() else { return };
-    let isolate = self.get_isolate_ptr();
-    if isolate.is_null() {
+    if self.get_isolate_ptr().is_null() {
       return;
     }
-    if unsafe { crate::locker::v8__Locker__IsLocked(isolate) } {
+    if self.on_isolate_thread() {
       drop(q);
       DeferredGlobalReset(data).reset();
     } else {
       v.push(DeferredGlobalReset(data));
+      self
+        .deferred_len
+        .store(v.len(), std::sync::atomic::Ordering::Relaxed);
     }
   }
 
-  /// Called with the isolate's lock held.
+  /// Cheap drain checkpoint: a relaxed load when the queue is empty.
+  /// The caller must be allowed to touch the isolate (home thread, or
+  /// holding the lock of a shared isolate).
+  #[inline(always)]
+  pub(crate) fn maybe_drain_deferred_global_resets(&self) {
+    if self.deferred_len.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+      self.drain_deferred_global_resets();
+    }
+  }
+
+  /// Called while allowed to touch the isolate.
   pub(crate) fn drain_deferred_global_resets(&self) {
     let drained = {
       let mut q = self.deferred_global_resets.lock().unwrap();
+      self
+        .deferred_len
+        .store(0, std::sync::atomic::Ordering::Relaxed);
       match q.as_mut() {
         Some(v) => std::mem::take(v),
         None => return,
@@ -2276,7 +2379,13 @@ impl IsolateLiveness {
   /// droppers that arrive after this see a closed queue and do nothing;
   /// their cells are freed with the isolate.
   pub(crate) fn close_deferred_global_resets(&self) {
-    let drained = self.deferred_global_resets.lock().unwrap().take();
+    let drained = {
+      let mut q = self.deferred_global_resets.lock().unwrap();
+      self
+        .deferred_len
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+      q.take()
+    };
     for reset in drained.into_iter().flatten() {
       reset.reset();
     }
@@ -2571,13 +2680,18 @@ impl OwnedIsolate {
   /// through a [`crate::Locker`] (e.g. `set_slot` under the lock) must
   /// be `Send` too — nothing checks it at insertion time.
   ///
-  /// No references previously obtained from a [`crate::Global`] through
-  /// [`crate::Global::open`] or [`std::borrow::Borrow`] may still be live when
-  /// this method is called. Opening and borrowing Globals is disabled after
-  /// sharing; create a [`crate::Local`] under a handle scope instead. Other
-  /// access to a Global belonging to this isolate, including cloning, hashing,
-  /// and comparing, requires holding its [`crate::Locker`]. Dropping one is the
-  /// sole exception and may happen on any thread.
+  /// The `OwnedIsolate` must still be on the thread where it was created.
+  /// This is guaranteed by its `!Send` type in safe Rust; callers that
+  /// reconstruct or transfer one through unsafe code must preserve that
+  /// invariant.
+  ///
+  /// No reference obtained through [`crate::Global::open`] may still be live
+  /// when this method is called. After sharing, opening a Global is unsafe and
+  /// its reference must not outlive the [`crate::Locker`] under which it was
+  /// opened or cross threads. Prefer creating a [`crate::Local`] under a handle
+  /// scope. Other access to a Global belonging to this isolate, including
+  /// cloning, hashing, and comparing, requires holding its Locker. Dropping one
+  /// is the sole exception and may happen on any thread.
   ///
   /// # Errors
   ///
@@ -2586,6 +2700,10 @@ impl OwnedIsolate {
   /// [`crate::Weak`] handles or pending finalizers, if it has a cppgc
   /// heap attached, or if another isolate is entered on top of this one
   /// on the current thread.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the isolate is no longer on the thread where it was created.
   pub unsafe fn try_into_shared(
     self,
   ) -> Result<crate::SharedIsolate, IntoSharedError> {
