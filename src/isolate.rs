@@ -619,6 +619,7 @@ unsafe extern "C" {
   );
   fn v8__Isolate__Enter(this: *mut RealIsolate);
   fn v8__Isolate__Exit(this: *mut RealIsolate);
+  fn v8__Global__Reset(data: *const Data);
   fn v8__Isolate__GetCurrent() -> *mut RealIsolate;
   fn v8__Isolate__MemoryPressureNotification(this: *mut RealIsolate, level: u8);
   fn v8__Isolate__ClearKeptObjects(isolate: *mut RealIsolate);
@@ -928,9 +929,11 @@ impl Isolate {
   fn new_impl(params: CreateParams) -> *mut RealIsolate {
     crate::V8::assert_initialized();
     let (raw_create_params, create_param_allocations) = params.finalize();
+    let has_embedder_cpp_heap = !raw_create_params.cpp_heap.is_null();
     let cxx_isolate = unsafe { v8__Isolate__New(&raw_create_params) };
     let mut isolate = unsafe { Isolate::from_raw_ptr(cxx_isolate) };
     isolate.initialize(create_param_allocations);
+    isolate.get_annex_mut().has_embedder_cpp_heap = has_embedder_cpp_heap;
     cxx_isolate
   }
 
@@ -1034,7 +1037,7 @@ impl Isolate {
   /// # Safety
   ///
   /// Called once per isolate, from teardown paths only.
-  unsafe fn prepare_annex_for_dispose(
+  pub(crate) unsafe fn prepare_annex_for_dispose(
     &mut self,
   ) -> (*mut IsolateAnnex, Box<dyn Any>) {
     let annex_ptr =
@@ -1087,7 +1090,9 @@ impl Isolate {
   /// `annex_ptr` must point at a live `IsolateAnnex` with `ANNEX_SLOT`
   /// still referencing it, so re-entrant callbacks resolve the annex
   /// through normal accessors.
-  unsafe fn run_remaining_guaranteed_finalizers(annex_ptr: *mut IsolateAnnex) {
+  pub(crate) unsafe fn run_remaining_guaranteed_finalizers(
+    annex_ptr: *mut IsolateAnnex,
+  ) {
     // Take the map out under a narrow borrow so the for-loop below
     // borrows a local instead of `(*annex_ptr).finalizer_map`. Callbacks
     // re-entering the annex via `get_annex_mut()` would otherwise alias
@@ -1112,7 +1117,7 @@ impl Isolate {
   /// `annex_ptr` must be the pointer returned from a matching
   /// [`Self::prepare_annex_for_dispose`] call, and the V8 isolate must
   /// already be fully disposed (so no further callbacks can fire).
-  unsafe fn finish_annex_dispose(annex_ptr: *mut IsolateAnnex) {
+  pub(crate) unsafe fn finish_annex_dispose(annex_ptr: *mut IsolateAnnex) {
     unsafe { Self::run_remaining_guaranteed_finalizers(annex_ptr) };
     unsafe { drop(Box::from_raw(annex_ptr)) };
   }
@@ -1178,6 +1183,20 @@ impl Isolate {
 
   pub(crate) fn get_finalizer_map_mut(&mut self) -> &mut FinalizerMap {
     &mut self.get_annex_mut().finalizer_map
+  }
+
+  pub(crate) fn live_weak_count_mut(&mut self) -> &mut usize {
+    &mut self.get_annex_mut().live_weak_count
+  }
+
+  /// Release one live-`Weak` count. Saturating, so that a mispaired
+  /// `Weak::from_raw` (which is `unsafe` and could hand the same raw
+  /// pointer out twice) can't wrap the counter and leave `try_into_shared`
+  /// panicking forever about weak handles that don't exist.
+  pub(crate) fn release_live_weak(&mut self) {
+    let count = self.live_weak_count_mut();
+    debug_assert!(*count > 0, "live weak count underflow");
+    *count = count.saturating_sub(1);
   }
 
   /// Retrieve embedder-specific data from the isolate.
@@ -1921,7 +1940,7 @@ impl Isolate {
 
   /// Disposes the isolate.  The isolate must not be entered by any
   /// thread to be disposable.
-  unsafe fn dispose(&mut self) {
+  pub(crate) unsafe fn dispose(&mut self) {
     // No test case in rusty_v8 show this, but there have been situations in
     // deno where dropping Annex before the states causes a segfault.
     unsafe {
@@ -2061,6 +2080,14 @@ pub(crate) struct IsolateAnnex {
   maybe_snapshot_creator: Option<SnapshotCreator>,
   isolate_handle: IsolateHandle,
   global_liveness: NonNull<IsolateLiveness>,
+  /// Number of live `Weak` handles, maintained so `try_into_shared()` can
+  /// reject isolates with outstanding weaks (their GC callbacks are not
+  /// thread-safe against the owning `Weak`).
+  live_weak_count: usize,
+  /// Whether an embedder cppgc heap was passed via `CreateParams`. V8
+  /// attaches a default cppgc heap of its own, so `GetCppHeap()` can't
+  /// distinguish; `try_into_shared()` rejects only embedder heaps.
+  has_embedder_cpp_heap: bool,
 }
 
 impl IsolateAnnex {
@@ -2076,6 +2103,8 @@ impl IsolateAnnex {
       maybe_snapshot_creator: None,
       isolate_handle: IsolateHandle::new(isolate),
       global_liveness: NonNull::from(global_liveness),
+      live_weak_count: 0,
+      has_embedder_cpp_heap: false,
     }
   }
 
@@ -2117,8 +2146,31 @@ impl IsolateAnnex {
   }
 }
 
+/// A unique obligation to reset one V8 global-handle cell.
+///
+/// The cell is stable until it is reset or its isolate is disposed. Moving the
+/// pointer between threads is safe, but resetting it is only safe while the
+/// destination thread holds the isolate's `v8::Locker`.
+struct DeferredGlobalReset(NonNull<Data>);
+
+// SAFETY: This token is only created by `Global::drop`; that `Global` uniquely
+// owns the cell and cannot use it again. The token is moved through a
+// mutex-protected queue and consumed only by a thread holding the V8 lock.
+unsafe impl Send for DeferredGlobalReset {}
+
+impl DeferredGlobalReset {
+  fn reset(self) {
+    unsafe { v8__Global__Reset(self.0.as_ptr()) };
+  }
+}
+
 pub(crate) struct IsolateLiveness {
   isolate: AtomicPtr<RealIsolate>,
+  shared: std::sync::atomic::AtomicBool,
+  /// V8 cells whose Rust `Global` owners were dropped without holding the
+  /// isolate's `v8::Locker`. Drained on the next lock boundary; `None` after
+  /// teardown has done its final drain. Only used when `shared` is set.
+  deferred_global_resets: Mutex<Option<Vec<DeferredGlobalReset>>>,
 }
 
 impl IsolateLiveness {
@@ -2126,6 +2178,8 @@ impl IsolateLiveness {
   fn new(isolate: &Isolate) -> Self {
     Self {
       isolate: AtomicPtr::new(isolate.as_real_ptr()),
+      shared: std::sync::atomic::AtomicBool::new(false),
+      deferred_global_resets: Mutex::new(Some(Vec::new())),
     }
   }
 
@@ -2139,6 +2193,93 @@ impl IsolateLiveness {
   #[inline(always)]
   pub(crate) fn get_isolate_ptr(&self) -> *mut RealIsolate {
     self.isolate.load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  pub(crate) fn mark_shared(&self) {
+    // Release/Acquire so a thread that observes `shared == false` (and
+    // takes the immediate-reset path in `Global::drop`) cannot do so
+    // after the isolate has started migrating between threads.
+    self
+      .shared
+      .store(true, std::sync::atomic::Ordering::Release);
+  }
+
+  #[inline(always)]
+  pub(crate) fn is_shared(&self) -> bool {
+    self.shared.load(std::sync::atomic::Ordering::Acquire)
+  }
+
+  /// Validate access to a shared isolate while synchronizing with teardown.
+  ///
+  /// The queue mutex keeps the isolate pointer valid through `IsLocked`. If the
+  /// current thread does hold the V8 lock, that lock in turn prevents teardown
+  /// after the mutex is released and for the duration of the caller's access.
+  pub(crate) fn assert_locked_for_shared_access(&self) {
+    if !self.is_shared() {
+      return;
+    }
+    let q = self.deferred_global_resets.lock().unwrap();
+    let isolate = self.get_isolate_ptr();
+    let isolate_is_live = q.is_some() && !isolate.is_null();
+    let is_locked = isolate_is_live
+      && unsafe { crate::locker::v8__Locker__IsLocked(isolate) };
+    drop(q);
+    assert!(
+      isolate_is_live,
+      "attempt to access Handle hosted by disposed Isolate"
+    );
+    assert!(
+      is_locked,
+      "accessing a Global belonging to a shared isolate requires holding its \
+       Locker on the current thread"
+    );
+  }
+
+  /// Release a `Global`'s cell now if the current thread holds the
+  /// isolate's lock; otherwise queue it for the next lock acquisition.
+  ///
+  /// While the queue is `Some`, teardown has not started: its final drain
+  /// closes the queue under this mutex before the isolate is disposed, so
+  /// the isolate pointer read below stays valid for the duration of this
+  /// call. The null check is belt and braces on top of that invariant: a
+  /// disposed isolate means the cell is already gone.
+  pub(crate) fn reset_or_defer_global(&self, data: NonNull<Data>) {
+    let mut q = self.deferred_global_resets.lock().unwrap();
+    let Some(v) = q.as_mut() else { return };
+    let isolate = self.get_isolate_ptr();
+    if isolate.is_null() {
+      return;
+    }
+    if unsafe { crate::locker::v8__Locker__IsLocked(isolate) } {
+      drop(q);
+      DeferredGlobalReset(data).reset();
+    } else {
+      v.push(DeferredGlobalReset(data));
+    }
+  }
+
+  /// Called with the isolate's lock held.
+  pub(crate) fn drain_deferred_global_resets(&self) {
+    let drained = {
+      let mut q = self.deferred_global_resets.lock().unwrap();
+      match q.as_mut() {
+        Some(v) => std::mem::take(v),
+        None => return,
+      }
+    };
+    for reset in drained {
+      reset.reset();
+    }
+  }
+
+  /// Final drain during teardown, with the isolate's lock held. Late
+  /// droppers that arrive after this see a closed queue and do nothing;
+  /// their cells are freed with the isolate.
+  pub(crate) fn close_deferred_global_resets(&self) {
+    let drained = self.deferred_global_resets.lock().unwrap().take();
+    for reset in drained.into_iter().flatten() {
+      reset.reset();
+    }
   }
 }
 
@@ -2321,6 +2462,78 @@ pub struct OwnedIsolate {
   cxx_isolate: NonNull<RealIsolate>,
 }
 
+/// The reason an [`OwnedIsolate`] could not be converted into a
+/// [`crate::SharedIsolate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntoSharedErrorKind {
+  SnapshotCreator,
+  LiveWeakHandlesOrPendingFinalizers,
+  EmbedderCppHeap,
+  AnotherIsolateEntered,
+}
+
+impl fmt::Display for IntoSharedErrorKind {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    let message = match self {
+      Self::SnapshotCreator => "snapshot-creator isolates cannot be shared",
+      Self::LiveWeakHandlesOrPendingFinalizers => {
+        "isolates with live v8::Weak handles or pending finalizers cannot be shared"
+      }
+      Self::EmbedderCppHeap => {
+        "isolates with an embedder cppgc heap cannot be shared"
+      }
+      Self::AnotherIsolateEntered => {
+        "try_into_shared() must be called with no other isolate entered on top of this one"
+      }
+    };
+    f.write_str(message)
+  }
+}
+
+/// A failed shared-isolate conversion.
+///
+/// The original isolate is retained so the rejected state can be cleaned up
+/// and conversion retried, or a snapshot creator can still produce its blob.
+/// Call [`Self::into_isolate`] to recover it. Dropping this error without
+/// recovering the isolate leaks it, because some rejected states (notably a
+/// snapshot creator or an isolate below another entered isolate) cannot run
+/// [`OwnedIsolate::drop`] safely at that point.
+#[derive(Debug)]
+pub struct IntoSharedError {
+  kind: IntoSharedErrorKind,
+  isolate: Option<OwnedIsolate>,
+}
+
+impl IntoSharedError {
+  pub fn kind(&self) -> IntoSharedErrorKind {
+    self.kind
+  }
+
+  pub fn into_isolate(mut self) -> OwnedIsolate {
+    self.isolate.take().unwrap()
+  }
+}
+
+impl Drop for IntoSharedError {
+  fn drop(&mut self) {
+    if let Some(isolate) = self.isolate.take() {
+      // `OwnedIsolate::drop` may itself panic for the state represented by this
+      // error. Leaking is the only generally safe default; callers that can fix
+      // the rejected state recover ownership with `into_isolate()`.
+      forget(isolate);
+    }
+  }
+}
+
+impl fmt::Display for IntoSharedError {
+  fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+    fmt::Display::fmt(&self.kind, f)
+  }
+}
+
+impl std::error::Error for IntoSharedError {}
+
 impl OwnedIsolate {
   pub(crate) fn new(cxx_isolate: *mut RealIsolate) -> Self {
     let isolate = Self::new_already_entered(cxx_isolate);
@@ -2335,6 +2548,79 @@ impl OwnedIsolate {
     let owned_isolate: OwnedIsolate = Self { cxx_isolate };
     // owned_isolate.init_scope_root();
     owned_isolate
+  }
+
+  /// Try to convert this isolate into a [`crate::SharedIsolate`] that can be
+  /// locked and used from any thread. The isolate is exited on the
+  /// current thread; all further access goes through
+  /// [`crate::SharedIsolate::lock`].
+  ///
+  /// # Safety
+  ///
+  /// A shared isolate migrates between threads together with everything
+  /// attached to it, without `Send` bounds the type system can check.
+  /// The caller must ensure that all embedder state hanging off the
+  /// isolate is `Send`: isolate slot values ([`Isolate::set_slot`]),
+  /// embedder data ([`Isolate::set_data`]), callbacks and their captured
+  /// state, and the allocations referenced by its `CreateParams`. All of
+  /// it may be accessed and eventually dropped on whichever thread holds
+  /// the lock or drops the `SharedIsolate`.
+  ///
+  /// This obligation covers the isolate's whole remaining lifetime, not
+  /// just the state present at this call: anything attached later
+  /// through a [`crate::Locker`] (e.g. `set_slot` under the lock) must
+  /// be `Send` too — nothing checks it at insertion time.
+  ///
+  /// No references previously obtained from a [`crate::Global`] through
+  /// [`crate::Global::open`] or [`std::borrow::Borrow`] may still be live when
+  /// this method is called. Opening and borrowing Globals is disabled after
+  /// sharing; create a [`crate::Local`] under a handle scope instead. Other
+  /// access to a Global belonging to this isolate, including cloning, hashing,
+  /// and comparing, requires holding its [`crate::Locker`]. Dropping one is the
+  /// sole exception and may happen on any thread.
+  ///
+  /// # Errors
+  ///
+  /// Returns the original isolate together with the rejection reason if this is
+  /// a snapshot-creator isolate, if it has live
+  /// [`crate::Weak`] handles or pending finalizers, if it has a cppgc
+  /// heap attached, or if another isolate is entered on top of this one
+  /// on the current thread.
+  pub unsafe fn try_into_shared(
+    self,
+  ) -> Result<crate::SharedIsolate, IntoSharedError> {
+    let error_kind = if unsafe {
+      !std::ptr::eq(self.cxx_isolate.as_ptr(), v8__Isolate__GetCurrent())
+    } {
+      Some(IntoSharedErrorKind::AnotherIsolateEntered)
+    } else {
+      let annex = self.get_annex();
+      if annex.maybe_snapshot_creator.is_some() {
+        Some(IntoSharedErrorKind::SnapshotCreator)
+      } else if annex.live_weak_count != 0 || !annex.finalizer_map.is_empty() {
+        Some(IntoSharedErrorKind::LiveWeakHandlesOrPendingFinalizers)
+      } else if annex.has_embedder_cpp_heap {
+        Some(IntoSharedErrorKind::EmbedderCppHeap)
+      } else {
+        None
+      }
+    };
+
+    if let Some(kind) = error_kind {
+      return Err(IntoSharedError {
+        kind,
+        isolate: Some(self),
+      });
+    }
+
+    unsafe {
+      let isolate_handle = self.thread_safe_handle();
+      self.global_liveness().as_ref().mark_shared();
+      self.exit();
+      let cxx_isolate = self.cxx_isolate;
+      forget(self);
+      Ok(crate::SharedIsolate::new(cxx_isolate, isolate_handle))
+    }
   }
 }
 

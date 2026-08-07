@@ -14432,3 +14432,961 @@ fn crdtp_dispatcher_cleanup_on_drop() {
   // Both DropTrackers should have been dropped via C++ destructor callback
   assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn shared_isolate_moves_between_threads() {
+  let _setup_guard = setup::parallel_test();
+
+  fn run(shared: &v8::SharedIsolate, code: &str) -> i32 {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    eval(scope, code).unwrap().int32_value(scope).unwrap()
+  }
+
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  assert_eq!(run(&shared, "6 * 7"), 42);
+  let shared = std::thread::spawn(move || {
+    assert_eq!(run(&shared, "7 * 7"), 49);
+    shared
+  })
+  .join()
+  .unwrap();
+  assert_eq!(run(&shared, "8 * 8"), 64);
+  // Tear down on a thread other than the creating one.
+  std::thread::spawn(move || drop(shared)).join().unwrap();
+}
+
+#[test]
+fn shared_isolate_concurrent_use() {
+  let _setup_guard = setup::parallel_test();
+  let shared = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+
+  // Set up a context, stash it in an isolate slot so every thread can
+  // reach it, and initialize a counter.
+  {
+    let mut locker = shared.lock();
+    let context = {
+      let scope = pin!(v8::HandleScope::new(&mut *locker));
+      let mut scope = scope.init();
+      let context = v8::Context::new(&scope, Default::default());
+      let scope = &mut v8::ContextScope::new(&mut scope, context);
+      eval(scope, "globalThis.count = 0").unwrap();
+      v8::Global::new(scope, context)
+    };
+    locker.set_slot(context);
+  }
+
+  let threads: Vec<_> = (0..4)
+    .map(|_| {
+      let shared_ = shared.clone();
+      std::thread::spawn(move || {
+        for _ in 0..25 {
+          let mut locker = shared_.lock();
+          let context = locker
+            .get_slot::<v8::Global<v8::Context>>()
+            .unwrap()
+            .clone();
+          let scope = pin!(v8::HandleScope::new(&mut *locker));
+          let mut scope = scope.init();
+          let context = v8::Local::new(&scope, context);
+          let scope = &mut v8::ContextScope::new(&mut scope, context);
+          eval(scope, "globalThis.count++").unwrap();
+        }
+      })
+    })
+    .collect();
+  for t in threads {
+    t.join().unwrap();
+  }
+
+  {
+    let mut locker = shared.lock();
+    let context = locker
+      .get_slot::<v8::Global<v8::Context>>()
+      .unwrap()
+      .clone();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Local::new(&scope, context);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    assert_eq!(
+      eval(scope, "globalThis.count")
+        .unwrap()
+        .int32_value(scope)
+        .unwrap(),
+      100
+    );
+  }
+}
+
+#[test]
+fn shared_isolate_deferred_global_resets_drain_at_lock_boundaries() {
+  let _setup_guard = setup::parallel_test();
+  let shared = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+
+  let (global_a, global_b, before, after_one, after_two) = {
+    let mut locker = shared.lock();
+    let before = locker.get_heap_statistics().used_global_handles_size();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let global_a =
+      v8::Global::new(&scope, v8::String::new(&scope, "deferred-a").unwrap());
+    let after_one = scope.get_heap_statistics().used_global_handles_size();
+    let global_b =
+      v8::Global::new(&scope, v8::String::new(&scope, "deferred-b").unwrap());
+    let after_two = scope.get_heap_statistics().used_global_handles_size();
+    (global_a, global_b, before, after_one, after_two)
+  };
+  assert!(after_one > before);
+  assert!(after_two > after_one);
+
+  // No thread holds the Locker, so A is queued. The other thread's lock
+  // acquisition must reset it before reporting the remaining handle size.
+  drop(global_a);
+
+  let (locked_tx, locked_rx) = std::sync::mpsc::channel::<usize>();
+  let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+  let shared_ = shared.clone();
+  let t = std::thread::spawn(move || {
+    let mut locker = shared_.lock();
+    let used = locker.get_heap_statistics().used_global_handles_size();
+    locked_tx.send(used).unwrap();
+    release_rx.recv().unwrap();
+  });
+  assert_eq!(locked_rx.recv().unwrap(), after_one);
+
+  // B is queued while the other thread owns the Locker. Its final drain must
+  // reset B before releasing the V8 lock.
+  drop(global_b);
+  release_tx.send(()).unwrap();
+  t.join().unwrap();
+
+  let mut locker = shared.lock();
+  assert_eq!(
+    locker.get_heap_statistics().used_global_handles_size(),
+    before
+  );
+}
+
+#[test]
+fn shared_isolate_deferred_global_resets_race_with_teardown() {
+  let _setup_guard = setup::parallel_test();
+  static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+  const GLOBAL_COUNT: usize = 64;
+
+  unsafe extern "C" fn count_and_free(buffer: *mut c_char, len: usize) {
+    let slice = std::ptr::slice_from_raw_parts_mut(buffer.cast::<u8>(), len);
+    unsafe { drop(Box::from_raw(slice)) };
+    DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+  }
+
+  DROP_COUNT.store(0, Ordering::SeqCst);
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut globals = {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    (0..GLOBAL_COUNT)
+      .map(|_| {
+        let buffer = vec![b'x'; 1024].into_boxed_slice();
+        let len = buffer.len();
+        let ptr = Box::into_raw(buffer).cast::<u8>().cast::<c_char>();
+        let string = unsafe {
+          v8::String::new_external_onebyte_raw(&scope, ptr, len, count_and_free)
+        }
+        .unwrap();
+        v8::Global::new(&scope, string)
+      })
+      .collect::<Vec<_>>()
+  };
+
+  // Guarantee that teardown has queued work to close and drain, then race the
+  // remaining Global drops against that close/dispose sequence.
+  let late_drops = globals.split_off(GLOBAL_COUNT / 2);
+  drop(globals);
+  let barrier = Arc::new(std::sync::Barrier::new(2));
+  let barrier_ = barrier.clone();
+  let teardown = std::thread::spawn(move || {
+    barrier_.wait();
+    drop(shared);
+  });
+  barrier.wait();
+  drop(late_drops);
+  teardown.join().unwrap();
+
+  assert_eq!(DROP_COUNT.load(Ordering::SeqCst), GLOBAL_COUNT);
+}
+
+#[test]
+#[should_panic(expected = "already locked")]
+fn shared_isolate_recursive_lock_panics() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let _l1 = shared.lock();
+  let _l2 = shared.lock();
+}
+
+#[test]
+#[should_panic(expected = "not supported on shared isolates")]
+fn shared_isolate_weak_panics() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker = shared.lock();
+  let scope = pin!(v8::HandleScope::new(&mut *locker));
+  let mut scope = scope.init();
+  let context = v8::Context::new(&scope, Default::default());
+  let scope = &mut v8::ContextScope::new(&mut scope, context);
+  let local = v8::String::new(scope, "w").unwrap();
+  let _weak = v8::Weak::new(scope, local);
+}
+
+#[test]
+fn shared_isolate_rejected_weak_finalizer_has_no_side_effect() {
+  let _setup_guard = setup::parallel_test();
+  let called = Arc::new(AtomicBool::new(false));
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let local = v8::String::new(scope, "w").unwrap();
+    let called_ = called.clone();
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _ = v8::Weak::with_guaranteed_finalizer(
+        scope,
+        local,
+        Box::new(move || {
+          called_.store(true, Ordering::SeqCst);
+        }),
+      );
+    }))
+    .unwrap_err();
+    let msg = err
+      .downcast_ref::<String>()
+      .map(|s| s.as_str())
+      .or_else(|| err.downcast_ref::<&str>().copied())
+      .unwrap();
+    assert!(msg.contains("not supported on shared isolates"));
+  }
+  drop(shared);
+  assert!(!called.load(Ordering::SeqCst));
+}
+
+// Keep each rejection in a separate test function. In optimized Windows ARM64
+// builds, combining all three `catch_unwind` regions in one function faults
+// while unwinding the first panic; each path unwinds correctly on its own.
+#[test]
+fn shared_isolate_global_clone_without_locker_is_rejected() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let global = {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    let local = v8::String::new(&scope, "locked").unwrap();
+    v8::Global::new(&scope, local)
+  };
+
+  let clone_err =
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| global.clone()))
+      .unwrap_err();
+  let clone_msg = clone_err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| clone_err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(clone_msg.contains("requires holding its Locker"));
+
+  let _locker = shared.lock();
+  drop(global.clone());
+}
+
+#[test]
+fn shared_isolate_global_borrow_is_rejected() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let global = {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    let local = v8::String::new(&scope, "locked").unwrap();
+    v8::Global::new(&scope, local)
+  };
+
+  let borrow_err =
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _: &v8::String = std::borrow::Borrow::borrow(&global);
+    }))
+    .unwrap_err();
+  let borrow_msg = borrow_err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| borrow_err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(borrow_msg.contains("create a Local"));
+}
+
+#[test]
+fn shared_isolate_global_open_is_rejected() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let global = {
+    let mut locker = shared.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    let local = v8::String::new(&scope, "locked").unwrap();
+    v8::Global::new(&scope, local)
+  };
+  let mut locker = shared.lock();
+  let open_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _ = global.open(&mut locker);
+  }))
+  .unwrap_err();
+  let open_msg = open_err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| open_err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(open_msg.contains("create a Local"));
+
+  // The lock-bound Local path remains available.
+  let scope = pin!(v8::HandleScope::new(&mut *locker));
+  let scope = scope.init();
+  let local = v8::Local::new(&scope, &global);
+  assert_eq!(local.to_rust_string_lossy(&scope), "locked");
+}
+
+#[test]
+fn shared_isolate_js_state_across_threads() {
+  let _setup_guard = setup::parallel_test();
+
+  // Each isolate gets: a suspended generator frame (locals `a`, `b`), a
+  // closure over a captured local `n`, and a suspended async-function
+  // frame (local `local`) parked on an unresolved promise.
+  fn init(shared: &v8::SharedIsolate, seed: i32) {
+    let mut locker = shared.lock();
+    let context = {
+      let scope = pin!(v8::HandleScope::new(&mut *locker));
+      let mut scope = scope.init();
+      let context = v8::Context::new(&scope, Default::default());
+      let scope = &mut v8::ContextScope::new(&mut scope, context);
+      let code = format!(
+        "function* fib() {{
+           let a = 0, b = 1;
+           for (;;) {{ yield a; [a, b] = [b, a + b]; }}
+         }}
+         globalThis.gen = fib();
+         globalThis.counter = ((start) => {{
+           let n = start;
+           return () => ++n;
+         }})({seed});
+         globalThis.result = 0;
+         (async () => {{
+           let local = 7;
+           const v = await new Promise((r) => {{
+             globalThis.resolveIt = r;
+           }});
+           globalThis.result = local * v;
+         }})();"
+      );
+      eval(scope, &code).unwrap();
+      v8::Global::new(scope, context)
+    };
+    locker.set_slot(context);
+  }
+
+  fn run(shared: &v8::SharedIsolate, code: &str) -> i32 {
+    let mut locker = shared.lock();
+    let context = locker
+      .get_slot::<v8::Global<v8::Context>>()
+      .unwrap()
+      .clone();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Local::new(&scope, context);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    eval(scope, code).unwrap().int32_value(scope).unwrap()
+  }
+
+  let iso_a = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+  let iso_b = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+
+  // Init A on this thread, B on another.
+  init(&iso_a, 100);
+  {
+    let b = iso_b.clone();
+    std::thread::spawn(move || init(&b, 200)).join().unwrap();
+  }
+
+  // Resume the suspended frames from interleaved threads and isolates;
+  // every value proves the frame's locals advanced exactly once per
+  // resumption, wherever it ran.  fib yields: 0 1 1 2 3 5 8 ...
+  assert_eq!(run(&iso_a, "gen.next().value"), 0); // A#1
+  {
+    let (a, b) = (iso_a.clone(), iso_b.clone());
+    std::thread::spawn(move || {
+      assert_eq!(run(&a, "gen.next().value"), 1); // A#2
+      assert_eq!(run(&b, "gen.next().value"), 0); // B#1
+      assert_eq!(run(&a, "counter()"), 101);
+      assert_eq!(run(&b, "counter()"), 201);
+    })
+    .join()
+    .unwrap();
+  }
+  assert_eq!(run(&iso_a, "gen.next().value"), 1); // A#3
+  {
+    let (a, b) = (iso_a.clone(), iso_b.clone());
+    std::thread::spawn(move || {
+      assert_eq!(run(&a, "gen.next().value"), 2); // A#4
+      assert_eq!(run(&b, "counter()"), 202);
+      assert_eq!(run(&b, "gen.next().value"), 1); // B#2
+    })
+    .join()
+    .unwrap();
+  }
+  assert_eq!(run(&iso_a, "counter()"), 102);
+
+  // Temporarily unlock A while using B on the same thread.
+  {
+    let mut la = iso_a.lock();
+    la.unlock(|| {
+      let mut lb = iso_b.lock();
+      let context = lb.get_slot::<v8::Global<v8::Context>>().unwrap().clone();
+      let scope = pin!(v8::HandleScope::new(&mut *lb));
+      let mut scope = scope.init();
+      let context = v8::Local::new(&scope, context);
+      let scope = &mut v8::ContextScope::new(&mut scope, context);
+      let v = eval(scope, "gen.next().value").unwrap(); // B#3
+      assert_eq!(v.int32_value(scope).unwrap(), 1);
+    });
+    let context = la.get_slot::<v8::Global<v8::Context>>().unwrap().clone();
+    let scope = pin!(v8::HandleScope::new(&mut *la));
+    let mut scope = scope.init();
+    let context = v8::Local::new(&scope, context);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let v = eval(scope, "gen.next().value").unwrap(); // A#5
+    assert_eq!(v.int32_value(scope).unwrap(), 3);
+  }
+
+  // Resolve A's parked async frame from a thread it has never suspended
+  // on; the auto microtask checkpoint resumes it there and the captured
+  // `local` must still be 7.
+  {
+    let a = iso_a.clone();
+    std::thread::spawn(move || {
+      assert_eq!(run(&a, "globalThis.resolveIt(6); 0"), 0);
+      assert_eq!(run(&a, "globalThis.result"), 42);
+    })
+    .join()
+    .unwrap();
+  }
+
+  // Concurrent phase: both isolates stepped in parallel from separate
+  // threads. Each isolate's lock serializes its own steps, so the final
+  // positions are deterministic: A has had 5 + 20 = 25 next() calls,
+  // B has had 3 + 20 = 23.
+  let ta = {
+    let a = iso_a.clone();
+    std::thread::spawn(move || {
+      for _ in 0..20 {
+        run(&a, "gen.next().value");
+      }
+    })
+  };
+  let tb = {
+    let b = iso_b.clone();
+    std::thread::spawn(move || {
+      for _ in 0..20 {
+        run(&b, "gen.next().value");
+      }
+    })
+  };
+  ta.join().unwrap();
+  tb.join().unwrap();
+  assert_eq!(run(&iso_a, "gen.next().value"), 75025); // fib call #26
+  assert_eq!(run(&iso_b, "gen.next().value"), 28657); // fib call #24
+  assert_eq!(run(&iso_a, "counter()"), 103);
+  assert_eq!(run(&iso_b, "counter()"), 203);
+}
+
+#[test]
+fn shared_isolate_rust_callback_across_threads() {
+  let _setup_guard = setup::parallel_test();
+
+  static CALLBACK_THREADS: Mutex<Vec<std::thread::ThreadId>> =
+    Mutex::new(Vec::new());
+
+  // JS -> Rust reentrancy under a Locker: allocate handles, open a
+  // nested scope, and call back into a JS closure (which bumps its
+  // captured `n`), all from whichever thread holds the lock.
+  fn rust_call_js(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+  ) {
+    CALLBACK_THREADS
+      .lock()
+      .unwrap()
+      .push(std::thread::current().id());
+    let nested = pin!(v8::EscapableHandleScope::new(scope));
+    let scope = &mut nested.init();
+    let context = scope.get_current_context();
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "counter").unwrap();
+    let counter: v8::Local<v8::Function> =
+      global.get(scope, key.into()).unwrap().try_into().unwrap();
+    let recv = v8::undefined(scope).into();
+    let n = counter.call(scope, recv, &[]).unwrap();
+    let n = n.int32_value(scope).unwrap();
+    let x = args.get(0).int32_value(scope).unwrap();
+    rv.set_int32(n + x);
+  }
+
+  let shared = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+  {
+    let mut locker = shared.lock();
+    let context = {
+      let scope = pin!(v8::HandleScope::new(&mut *locker));
+      let mut scope = scope.init();
+      let context = v8::Context::new(&scope, Default::default());
+      let scope = &mut v8::ContextScope::new(&mut scope, context);
+      eval(
+        scope,
+        "globalThis.counter = ((start) => {
+           let n = start;
+           return () => ++n;
+         })(1000);",
+      )
+      .unwrap();
+      let func = v8::Function::new(scope, rust_call_js).unwrap();
+      let key = v8::String::new(scope, "rustCallJs").unwrap();
+      context
+        .global(scope)
+        .set(scope, key.into(), func.into())
+        .unwrap();
+      v8::Global::new(scope, context)
+    };
+    locker.set_slot(context);
+  }
+
+  fn run(shared: &v8::SharedIsolate, code: &str) -> i32 {
+    let mut locker = shared.lock();
+    let context = locker
+      .get_slot::<v8::Global<v8::Context>>()
+      .unwrap()
+      .clone();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Local::new(&scope, context);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    eval(scope, code).unwrap().int32_value(scope).unwrap()
+  }
+
+  // counter() yields 1001, 1002, 1003 across three threads; the Rust
+  // frame in the middle must not disturb it or the scope stack.
+  {
+    let s = shared.clone();
+    std::thread::spawn(move || {
+      assert_eq!(run(&s, "rustCallJs(1)"), 1002);
+    })
+    .join()
+    .unwrap();
+  }
+  assert_eq!(run(&shared, "rustCallJs(2)"), 1004);
+  {
+    let s = shared.clone();
+    std::thread::spawn(move || {
+      // Deeper reentrancy: JS -> Rust -> JS -> Rust -> JS.
+      assert_eq!(run(&s, "rustCallJs(rustCallJs(3))"), 2010);
+    })
+    .join()
+    .unwrap();
+  }
+
+  let threads = CALLBACK_THREADS.lock().unwrap();
+  assert_eq!(threads.len(), 4);
+  // First call, second call, and the nested pair each ran on distinct
+  // threads; the nested pair shares one thread.
+  assert_ne!(threads[0], threads[1]);
+  assert_ne!(threads[0], threads[2]);
+  assert_ne!(threads[1], threads[2]);
+  assert_eq!(threads[2], threads[3]);
+}
+
+#[test]
+fn shared_isolate_rejects_nested_lockers() {
+  let _setup_guard = setup::parallel_test();
+  let shared_a = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let shared_b = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker_a = shared_a.lock();
+  // Reject nesting before constructing B's v8::Locker or entering B. If this
+  // were allowed, dropping A first would leave its C++ lock permanently held.
+  let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let _locker_b = shared_b.lock();
+  }))
+  .unwrap_err();
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(msg.contains("another isolate is entered"));
+
+  // The rejected acquisition has not disturbed A.
+  let scope = pin!(v8::HandleScope::new(&mut *locker_a));
+  let mut scope = scope.init();
+  let context = v8::Context::new(&scope, Default::default());
+  let scope = &mut v8::ContextScope::new(&mut scope, context);
+  assert_eq!(eval(scope, "6 * 7").unwrap().int32_value(scope), Some(42));
+}
+
+#[test]
+fn shared_isolate_after_weak_into_raw() {
+  let _setup_guard = setup::parallel_test();
+  let mut isolate = v8::Isolate::new(Default::default());
+  let raw = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let obj = v8::Object::new(scope);
+    v8::Weak::new(scope, obj).into_raw().unwrap()
+  };
+
+  // A raw Weak still owns callback state and must keep conversion disabled.
+  let err = unsafe { isolate.try_into_shared() }.unwrap_err();
+  assert_eq!(
+    err.kind(),
+    v8::IntoSharedErrorKind::LiveWeakHandlesOrPendingFinalizers
+  );
+  let mut isolate = err.into_isolate();
+  drop(unsafe { v8::Weak::from_raw(&mut isolate, Some(raw)) });
+
+  // None-path: the value is GC'd with no finalizer pending, so into_raw must
+  // release the count itself.
+  let weak = {
+    let scope = pin!(v8::HandleScope::new(&mut isolate));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let scope2 = pin!(v8::HandleScope::new(scope));
+    let scope2 = &mut scope2.init();
+    let obj2 = v8::Object::new(scope2);
+    v8::Weak::new(scope2, obj2)
+  };
+  isolate.low_memory_notification();
+  assert!(weak.into_raw().is_none());
+  // Both paths now leave the count balanced for sharing to succeed.
+  drop(unsafe { isolate.try_into_shared().unwrap() });
+}
+
+#[test]
+fn shared_isolate_conversion_errors_return_the_isolate() {
+  let _setup_guard = setup::sequential_test();
+
+  let isolate_a = v8::Isolate::new(Default::default());
+  let isolate_b = v8::Isolate::new(Default::default());
+  let err = unsafe { isolate_a.try_into_shared() }.unwrap_err();
+  assert_eq!(err.kind(), v8::IntoSharedErrorKind::AnotherIsolateEntered);
+  drop(isolate_b);
+  drop(unsafe { err.into_isolate().try_into_shared().unwrap() });
+
+  let snapshot_creator = v8::Isolate::snapshot_creator(None, None);
+  let err = unsafe { snapshot_creator.try_into_shared() }.unwrap_err();
+  assert_eq!(err.kind(), v8::IntoSharedErrorKind::SnapshotCreator);
+  let mut snapshot_creator = err.into_isolate();
+  {
+    v8::scope!(let scope, &mut snapshot_creator);
+    let context = v8::Context::new(scope, Default::default());
+    scope.set_default_context(context);
+  }
+  assert!(
+    snapshot_creator
+      .create_blob(v8::FunctionCodeHandling::Clear)
+      .is_some()
+  );
+}
+
+#[test]
+fn shared_isolate_unlock_drains_globals_on_relock() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker = shared.lock();
+  let before = locker.get_heap_statistics().used_global_handles_size();
+  let global = {
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let scope = scope.init();
+    v8::Global::new(&scope, v8::String::new(&scope, "unlock-deferred").unwrap())
+  };
+  assert!(locker.get_heap_statistics().used_global_handles_size() > before);
+
+  locker.unlock(|| drop(global));
+  assert_eq!(
+    locker.get_heap_statistics().used_global_handles_size(),
+    before
+  );
+}
+
+#[test]
+fn shared_isolate_unlock_lets_another_thread_in() {
+  let _setup_guard = setup::parallel_test();
+  let shared = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+  {
+    let mut locker = shared.lock();
+    let context = {
+      let scope = pin!(v8::HandleScope::new(&mut *locker));
+      let mut scope = scope.init();
+      let context = v8::Context::new(&scope, Default::default());
+      let scope = &mut v8::ContextScope::new(&mut scope, context);
+      eval(scope, "globalThis.n = 0").unwrap();
+      v8::Global::new(scope, context)
+    };
+    locker.set_slot(context);
+  }
+
+  fn run(shared: &v8::SharedIsolate, code: &str) -> i32 {
+    let mut locker = shared.lock();
+    let context = locker
+      .get_slot::<v8::Global<v8::Context>>()
+      .unwrap()
+      .clone();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Local::new(&scope, context);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    eval(scope, code).unwrap().int32_value(scope).unwrap()
+  }
+
+  let (unlocked_tx, unlocked_rx) = std::sync::mpsc::channel::<()>();
+  let (done_tx, done_rx) = std::sync::mpsc::channel::<i32>();
+  let shared_ = shared.clone();
+  let t = std::thread::spawn(move || {
+    // Only starts once the main thread is inside its unlock window; this
+    // would block forever if `unlock` didn't actually release the lock.
+    unlocked_rx.recv().unwrap();
+    done_tx.send(run(&shared_, "++globalThis.n")).unwrap();
+  });
+
+  let mut locker = shared.lock();
+  let observed = locker.unlock(|| {
+    unlocked_tx.send(()).unwrap();
+    done_rx.recv().unwrap()
+  });
+  assert_eq!(observed, 1);
+
+  // Back under the lock: the isolate is usable again and the other
+  // thread's mutation is visible.
+  let context = locker
+    .get_slot::<v8::Global<v8::Context>>()
+    .unwrap()
+    .clone();
+  {
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Local::new(&scope, context);
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let v = eval(scope, "globalThis.n").unwrap();
+    assert_eq!(v.int32_value(scope).unwrap(), 1);
+  }
+  drop(locker);
+  t.join().unwrap();
+  assert_eq!(run(&shared, "globalThis.n"), 1);
+}
+
+#[test]
+fn shared_isolate_unlock_exits_and_reenters() {
+  let _setup_guard = setup::parallel_test();
+  let shared_a = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let shared_b = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker_a = shared_a.lock();
+
+  // A must no longer be the current isolate while it is unlocked, so another
+  // shared isolate can be entered on this thread for the duration of `f`.
+  let result = locker_a.unlock(|| {
+    let mut locker_b = shared_b.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker_b));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    eval(scope, "40 + 2").unwrap().int32_value(scope).unwrap()
+  });
+  assert_eq!(result, 42);
+
+  // The Unlocker destructor reacquired A's lock and the guard re-entered it.
+  let scope = pin!(v8::HandleScope::new(&mut *locker_a));
+  let mut scope = scope.init();
+  let context = v8::Context::new(&scope, Default::default());
+  let scope = &mut v8::ContextScope::new(&mut scope, context);
+  assert_eq!(eval(scope, "6 * 7").unwrap().int32_value(scope), Some(42));
+}
+
+#[test]
+fn shared_isolate_unlock_restores_lock_on_panic() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker = shared.lock();
+  let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    locker.unlock(|| panic!("boom"));
+  }))
+  .unwrap_err();
+  assert_eq!(err.downcast_ref::<&str>().copied(), Some("boom"));
+  // The unwind must have reacquired the lock and re-entered the isolate,
+  // otherwise this use — and `Locker`'s own drop — would abort.
+  {
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let v = eval(scope, "6 * 7").unwrap();
+    assert_eq!(v.int32_value(scope).unwrap(), 42);
+  }
+  drop(locker);
+}
+
+#[test]
+fn shared_isolate_unlock_rejects_returned_entered_isolate() {
+  let _setup_guard = setup::parallel_test();
+  let shared = unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  };
+  let mut locker = shared.lock();
+  let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    locker.unlock(|| v8::Isolate::new(Default::default()));
+  }))
+  .unwrap_err();
+  let msg = err
+    .downcast_ref::<String>()
+    .map(|s| s.as_str())
+    .or_else(|| err.downcast_ref::<&str>().copied())
+    .unwrap();
+  assert!(msg.contains("still entered"));
+
+  // The returned isolate was dropped before A was relocked, so A is restored.
+  let scope = pin!(v8::HandleScope::new(&mut *locker));
+  let mut scope = scope.init();
+  let context = v8::Context::new(&scope, Default::default());
+  let scope = &mut v8::ContextScope::new(&mut scope, context);
+  assert_eq!(eval(scope, "6 * 7").unwrap().int32_value(scope), Some(42));
+}
+
+#[test]
+fn shared_isolate_terminate_from_thread_safe_handle() {
+  let _setup_guard = setup::parallel_test();
+  let shared = Arc::new(unsafe {
+    v8::Isolate::new(Default::default())
+      .try_into_shared()
+      .unwrap()
+  });
+  let (running_tx, running_rx) = std::sync::mpsc::channel::<()>();
+  let shared_ = shared.clone();
+  let t = std::thread::spawn(move || {
+    let mut locker = shared_.lock();
+    let scope = pin!(v8::HandleScope::new(&mut *locker));
+    let mut scope = scope.init();
+    let context = v8::Context::new(&scope, Default::default());
+    let scope = &mut v8::ContextScope::new(&mut scope, context);
+    let source = v8::String::new(scope, "while (true) {}").unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    running_tx.send(()).unwrap();
+    // Terminated from the main thread; `run` returns None.
+    assert!(script.run(scope).is_none());
+  });
+
+  running_rx.recv().unwrap();
+  // Let the loop actually get going inside V8. `terminate_execution` is
+  // sticky, so an early call would still be honoured; the sleep just makes
+  // the test exercise the interesting case.
+  std::thread::sleep(std::time::Duration::from_millis(200));
+  // Obtain the handle while another thread holds the Locker. This must only
+  // clone the handle cached by SharedIsolate, without touching V8 or its annex.
+  let handle = shared.thread_safe_handle();
+  assert!(handle.terminate_execution());
+  t.join().unwrap();
+}
