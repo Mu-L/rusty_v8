@@ -16,6 +16,8 @@
 #include "libplatform/libplatform.h"
 #include "support.h"
 #include "unicode/locid.h"
+#include "unicode/timezone.h"
+#include "unicode/unistr.h"
 #include "v8-callbacks.h"
 #include "v8-cppgc.h"
 #include "v8-fast-api-calls.h"
@@ -4517,6 +4519,39 @@ size_t icu_get_default_locale(char* output, size_t output_len) {
 void icu_set_default_locale(const char* locale) {
   UErrorCode status = U_ZERO_ERROR;
   icu::Locale::setDefault(icu::Locale(locale), status);
+}
+
+size_t icu_get_default_time_zone(char* output, size_t output_len) {
+  icu::UnicodeString id;
+  std::unique_ptr<icu::TimeZone> tz(icu::TimeZone::createDefault());
+  tz->getID(id);
+  icu::CheckedArrayByteSink sink(output, static_cast<uint32_t>(output_len));
+  id.toUTF8(sink);
+  assert(!sink.Overflowed());
+  // Deliberately not `NumberOfBytesAppended()`: that counts bytes the sink was
+  // asked to write, so on overflow it exceeds `output_len` and the caller would
+  // read past the buffer (the assert above is compiled out in release builds).
+  return sink.NumberOfBytesWritten();
+}
+
+// NOTE: the parameter is deliberately not named `timezone`; glibc's <time.h>
+// declares a global with that name and the build uses -Werror,-Wshadow.
+bool icu_set_default_time_zone(const char* time_zone_id) {
+  // `createTimeZone()` never fails: an id it does not recognize yields the
+  // special "unknown" zone (which behaves as GMT). Detect that and report it
+  // instead of silently installing GMT.
+  std::unique_ptr<icu::TimeZone> tz(icu::TimeZone::createTimeZone(
+      icu::UnicodeString::fromUTF8(time_zone_id)));
+  icu::UnicodeString id;
+  tz->getID(id);
+  if (id == icu::UnicodeString(UCAL_UNKNOWN_ZONE_ID, -1, US_INV)) {
+    return false;
+  }
+  // Takes ownership of the created TimeZone and installs it as the process
+  // wide default, so ICU (and therefore V8's Date implementation) resolves
+  // the given id regardless of how the host reports its time zone.
+  icu::TimeZone::adoptDefault(tz.release());
+  return true;
 }
 
 }  // extern "C"
