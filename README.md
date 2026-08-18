@@ -143,6 +143,21 @@ export RUSTY_V8_ARCHIVE=/path/to/custom_archive.a
 cargo build
 ```
 
+## The `RUSTY_V8_SKIP_DOWNLOAD` environment variable
+
+Set `RUSTY_V8_SKIP_DOWNLOAD=1` to skip downloading the prebuilt static
+library. The small generated binding file is still fetched, so `cargo check`
+and rust-analyzer work without the (large) prebuilt artifact. Producing a
+binary still requires the static library: `cargo build` fails at link time
+until the crate is built again with the variable unset.
+
+This variable takes precedence over `RUSTY_V8_ARCHIVE` and `RUSTY_V8_MIRROR`
+(the static library is not fetched from anywhere, not even from a local
+archive), and it has no effect on `V8_FROM_SOURCE=1` builds. If the binding
+file cannot be fetched (for example, the configured mirror does not carry it)
+but a previously downloaded binding exists on disk, that file is reused with
+a warning instead of failing the build.
+
 ## Build V8 from Source
 
 Use `V8_FROM_SOURCE=1 cargo build -vv` to build the crate completely from

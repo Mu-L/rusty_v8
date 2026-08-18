@@ -73,6 +73,7 @@ fn main() {
     "RUSTY_V8_MIRROR_TAG",
     "RUSTY_V8_MIRROR_FALLBACK",
     "RUSTY_V8_MUSL_SYSROOT",
+    "RUSTY_V8_SKIP_DOWNLOAD",
     "RUSTY_V8_SRC_BINDING_PATH",
     "SCCACHE",
     "V8_FORCE_DEBUG",
@@ -93,16 +94,8 @@ fn main() {
   // Don't build V8 if "cargo doc" is being run. This is to support docs.rs.
   let is_cargo_doc = env::var_os("DOCS_RS").is_some();
 
-  // Don't build V8 if the rust language server (RLS) is running.
-  let is_rls = env::var_os("CARGO")
-    .map(PathBuf::from)
-    .as_ref()
-    .and_then(|p| p.file_stem())
-    .and_then(|f| f.to_str())
-    .is_some_and(|s| s.starts_with("rls"));
-
   // Early exit
-  if is_cargo_doc || is_rls {
+  if is_cargo_doc {
     print_prebuilt_src_binding_path();
     return;
   }
@@ -949,20 +942,32 @@ fn replace_non_alphanumeric(url: &str) -> String {
 /// Panics with the full list of attempted URLs, and the escape hatches, if
 /// every candidate fails.
 fn download_artifact(urls: &[String], filename: &Path) {
+  if let Err(error) = try_download_artifact(urls, filename) {
+    panic!("{error}");
+  }
+}
+
+/// Like [`download_artifact`], but returns the diagnostic instead of
+/// panicking, so callers can fall back on failure (e.g.
+/// `RUSTY_V8_SKIP_DOWNLOAD` reusing an existing binding).
+fn try_download_artifact(
+  urls: &[String],
+  filename: &Path,
+) -> Result<(), String> {
   // Checksum (i.e: source URL) to avoid re-downloads: reuse the existing file
   // if it was fetched from any URL we would fetch from now.
   if filename.exists()
     && let Ok(recorded) = fs::read_to_string(static_checksum_path(filename))
     && urls.contains(&recorded)
   {
-    return;
+    return Ok(());
   }
 
   let mut errors = Vec::new();
   for url in urls {
     println!("Trying to fetch from {url}");
     match download_file(url, filename) {
-      Ok(()) => return,
+      Ok(()) => return Ok(()),
       Err(error) => {
         println!("Failed to fetch from {url}: {error}");
         errors.push(format!("- {url}: {error}"));
@@ -979,16 +984,17 @@ fn download_artifact(urls: &[String], filename: &Path) {
   } else {
     ""
   };
-  panic!(
+  Err(format!(
     "Failed to fetch the V8 prebuilt artifact {}. Tried:\n{}\n\
      If no prebuilt artifact is published for your target or version, \
      compile V8 from source by setting V8_FROM_SOURCE=1. You can also point \
      the build at an artifact via RUSTY_V8_ARCHIVE (static lib only), a \
+     local binding via RUSTY_V8_SRC_BINDING_PATH (src binding only), a \
      mirror via RUSTY_V8_MIRROR, or another release tag via \
      RUSTY_V8_MIRROR_TAG.{fallback_hint}",
     filename.display(),
     errors.join("\n")
-  );
+  ))
 }
 
 fn download_file(url: &str, filename: &Path) -> Result<(), String> {
@@ -1126,6 +1132,29 @@ fn download_static_lib_binaries() {
   fs::create_dir_all(&dir)
     .unwrap_or_else(|e| panic!("failed to create {}: {e}", dir.display()));
   println!("cargo:rustc-link-search={}", dir.display());
+
+  // RUSTY_V8_SKIP_DOWNLOAD skips fetching the static library (including from
+  // RUSTY_V8_ARCHIVE) so that `cargo check` and rust-analyzer can resolve the
+  // crate without the prebuilt artifact. The (small) src binding file is
+  // still fetched; only linking requires the static library. A library left
+  // behind by a previous build is linked as usual.
+  if env_bool("RUSTY_V8_SKIP_DOWNLOAD") {
+    if static_lib_path().exists() {
+      println!(
+        "cargo:warning=RUSTY_V8_SKIP_DOWNLOAD is set; using the existing {} \
+         as-is (it may be stale)",
+        static_lib_path().display()
+      );
+    } else {
+      println!(
+        "cargo:warning=RUSTY_V8_SKIP_DOWNLOAD is set; the V8 static library \
+         was not downloaded. `cargo check` will work, but linking will fail \
+         with 'could not find native static library `rusty_v8`' until this \
+         is built again without RUSTY_V8_SKIP_DOWNLOAD"
+      );
+    }
+    return;
+  }
 
   // RUSTY_V8_ARCHIVE points at exactly one archive and short-circuits the
   // mirror/upstream candidates entirely.
@@ -1327,7 +1356,24 @@ fn print_prebuilt_src_binding_path() {
         panic!("failed to create {}: {e}", parent.display())
       });
     }
-    download_artifact(&artifact_url_candidates(&name), &src_binding_path);
+    if let Err(error) =
+      try_download_artifact(&artifact_url_candidates(&name), &src_binding_path)
+    {
+      // Under RUSTY_V8_SKIP_DOWNLOAD a stale-but-usable binding beats a
+      // failed refresh: dev contexts pointed at an incomplete mirror still
+      // need `cargo check` to pass. A failed fetch never truncates the
+      // existing file (downloads land in a scratch file that is only renamed
+      // into place on success).
+      if env_bool("RUSTY_V8_SKIP_DOWNLOAD") && src_binding_path.exists() {
+        println!(
+          "cargo:warning=RUSTY_V8_SKIP_DOWNLOAD is set; could not refresh \
+           the src binding, using the existing {} as-is (it may be stale)",
+          src_binding_path.display()
+        );
+      } else {
+        panic!("{error}");
+      }
+    }
   }
 
   println!(
